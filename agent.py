@@ -1,9 +1,10 @@
 import requests
 import base64
-from pprint import pprint as pp
+from pprint import pformat
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from dataclasses import dataclass
+from logging import Logger
 from ocr_solver import OCRSolver
 
 @dataclass
@@ -15,6 +16,7 @@ class Slot:
     startTime: str
     endTime: str
     totalFee: float
+    userGroupNo: str
     bookingProgress: str
     bookingProgressEnc: str
 
@@ -28,6 +30,7 @@ class Slot:
             startTime=data['startTime'],
             endTime=data['endTime'],
             totalFee=data['totalFee'],
+            userGroupNo=data['userFixGrpNo'],
             bookingProgress=data['bookingProgress'],
             bookingProgressEnc=data['bookingProgressEnc']
         )
@@ -49,6 +52,7 @@ class BookedSlot:
     startTime: str
     endTime: str
     totalFee: float
+    userGroupNo: str
     
     @classmethod
     def from_dict(cls, data):
@@ -61,7 +65,8 @@ class BookedSlot:
             slotRefDate=data['slotRefDate'],
             startTime=data['startTime'],
             endTime=data['endTime'],
-            totalFee=data['totalFee']
+            totalFee=data['totalFee'],
+            userGroupNo=data['userFixGrpNo']
         )
     
     def __str__(self):
@@ -69,8 +74,9 @@ class BookedSlot:
 
 class Agent:
 
-    def __init__(self):
+    def __init__(self, logger: Logger):
         self.__ocr_solver = OCRSolver()
+        self.__logger = logger
 
     headers = {
         'authority': 'booking.bbdc.sg',
@@ -93,6 +99,22 @@ class Agent:
     saved_username = ''
     saved_password = ''
 
+    def __debug(self, msg: str):
+        ''' Log a debug message. '''
+        self.__logger.debug(msg)
+    
+    def __info(self, msg: str):
+        ''' Log an info message. '''
+        self.__logger.info(msg)
+
+    def __warn(self, msg: str):
+        ''' Log a warning message. '''
+        self.__logger.warning(msg)
+    
+    def __error(self, msg: str):
+        ''' Log an error message. '''
+        self.__logger.error(msg)
+
     def __get_tmp_file_path(self):
         ''' Get the path to the temporary file. '''
         return '/tmp/bbdc_captcha.png'
@@ -100,17 +122,18 @@ class Agent:
     def solve_captcha(self, captcha_type: str, tries: int = 10):
         ''' Attempt to pass the captcha, returning the captcha data and token. '''
         assert captcha_type in ['login', 'booking']
+        self.__info(f'Solving captcha..., type: {captcha_type}, tries: {tries}.')
         login_captcha_url = 'https://booking.bbdc.sg/bbdc-back-service/api/auth/getLoginCaptchaImage'
         booking_captcha_url = 'https://booking.bbdc.sg/bbdc-back-service/api/booking/manage/getCaptchaImage'
         for i in range(tries):
-            print('Captcha attempt #' + str(i + 1))
+            self.__info('Captcha attempt #' + str(i + 1))
             # get captcha image and save to disk
-            if captcha_type == 'login': 
+            if captcha_type == 'login':
                 res = requests.post(login_captcha_url, headers=self.headers).json()
             else:
-                res = self.post_signed(booking_captcha_url, {}).json()
+                res = self.post_signed(booking_captcha_url, {})
             if not res['success']:
-                print('Failed to get captcha. Error: ' + res['message'])
+                self.__warn('Failed to get captcha. Error: ' + res['message'])
                 continue
             data = res['data']
             base64_image = data['image']
@@ -119,20 +142,21 @@ class Agent:
             # solve captcha
             answer = self.__ocr_solver.solve(self.__get_tmp_file_path())
             if len(answer) != 5:
-                print('Improper captcha answer: ' + answer)
+                self.__warn('Improper captcha answer: ' + answer)
                 continue
             data['answer'] = answer
-            print('Captcha solved (probably): ')
+            self.__info('Captcha solved (probably).')
             del data['image']
-            pp(data)
+            self.__debug(pformat(data, indent=4))
             return data
-        raise Exception('Failed to solve captcha.')       
+        self.__error('Failed to solve captcha.')
 
     def authenticate(self, username: str, password: str, tries: int = 10):
         ''' Authenticate to the website. '''
+        self.__info(f'Authenticating..., username: {username}, tries: {tries}.')
         login_url = 'https://booking.bbdc.sg/bbdc-back-service/api/auth/login'
         for i in range(tries):
-            print('Authenticate attempt #' + str(i + 1))
+            self.__info('Authenticate attempt #' + str(i + 1))
             # solve captcha
             captcha_data = self.solve_captcha('login')
             # authenticate
@@ -145,10 +169,10 @@ class Agent:
             }
             res = requests.post(login_url, headers=self.headers, json=payload).json()
             if not res['success']:
-                print('Failed to authenticate. Error: ' + res['message'])
+                self.__warn('Failed to authenticate. Error: ' + res['message'])
                 continue
             self.authorization_token = res['data']['tokenContent']
-            print('Successfully authenticated as ' + res['data']['username'])
+            self.__info('Successfully authenticated as ' + res['data']['username'])
             # save credentials for reauthentication
             self.saved_username = username
             self.saved_password = password
@@ -158,23 +182,26 @@ class Agent:
         return None
         
     def get_course_authorization_token(self):
+        self.__info('Getting course authorization token...')
         url = 'https://booking.bbdc.sg/bbdc-back-service/api/account/listAccountCourseType'
         payload = {}
         res = self.post_signed(url, payload)
         if not res['success']:
-            print('Failed to get course authorization token. Error: ' + res['message'])
+            self.__error('Failed to get course authorization token. Error: ' + res['message'])
             return
         self.course_authorization_token = res['data']['activeCourseList'][0]['authToken']
-        print('Successfully got course authorization token.')
+        self.__info('Successfully got course authorization token.')
     
     def reauthenticate(self):
         ''' Reauthenticate using saved credentials. '''
+        self.__info('Reauthenticating...')
         if self.saved_username == '' or self.saved_password == '':
             raise Exception('No saved credentials to reauthenticate.')
         self.authenticate(self.saved_username, self.saved_password)
        
-    def post_signed(self, url: str, data: dict):
+    def post_signed(self, url: str, data: dict) -> dict:
         ''' Post data to a signed endpoint. '''
+        self.__info(f'POST {url}')
         headers = self.headers.copy()
         headers['authorization'] = self.authorization_token
         headers['jsessionid'] = self.course_authorization_token
@@ -182,8 +209,10 @@ class Agent:
             'bbdc-token': self.authorization_token.replace(' ', '%20')
         }
         response = requests.post(url, headers=headers, json=data, cookies=cookies)
+        self.__debug(pformat(response, indent=4))
+        self.__debug(pformat(response.json(), indent=4))
         if response.status_code == 402:
-            print('Session expired. Re-authenticating...')
+            self.__info('Session expired. Re-authenticating...')
             self.reauthenticate()
             # retry request
             return self.post_signed(url, data)
@@ -204,23 +233,24 @@ class Agent:
     
     def get_available_practical_slots(self, maximum_months_into_future: int = 3):
         ''' Check for available practical slots. '''
+        self.__info(f'Checking for available practical slots, maximum months into future: {maximum_months_into_future}.')
         all_slots = []
         for i in range(maximum_months_into_future):
-            print(f'Checking {i} months into the future...')
+            self.__info(f'Checking {i} months into the future...')
             month = (datetime.now() + relativedelta(months=i)).strftime('%Y%m')
             res = self.api_list_c3_practical_slot_released(month)
             if not res['success']:
-                print('Failed to check available slots. Error: ' + res['message'])
+                self.__error('Failed to check available slots. Error: ' + res['message'])
                 continue
             slots = res['data']['releasedSlotListGroupByDay']
             if slots is None:
-                print(f'No slots found in {month}.')
+                self.__info(f'No slots found in {month}.')
                 continue
-            slots = [Slot.from_dict(slot) for slot in sum(slots.values())]
+            slots = [Slot.from_dict(slot) for slot in sum(slots.values(), start=[])]
             slots = [slot for slot in slots if slot.is_available()]
-            print(f'Found {len(slots)} slots in {month}:')
-            pp(slots)
             all_slots += slots
+            self.__info(f'Found {len(slots)} slots in {month}:')
+            self.__debug(pformat(slots, indent=4))
         return all_slots
     
     def api_book_c3_practical_slot(self, captcha_data: dict, slot: Slot):
@@ -243,14 +273,15 @@ class Agent:
     
     def book_practical_slot(self, slot: Slot):
         ''' Book a practical slot. '''
+        self.__info(f'Booking slot: {pformat(slot, indent=4)}.')
         # solve captcha
         captcha_data = self.solve_captcha('booking')
         # book slot
         res = self.api_book_c3_practical_slot(captcha_data, slot)
         if not res['success']:
-            print('Failed to book slot. Error: ' + res['message'])
+            self.__error('Failed to book slot. Error: ' + res['message'])
             return False
-        print('Successfully booked slot.')
+        self.__info('Successfully booked slot.')
         return True
     
     def api_list_booked_c3_practical_slots(self, month: str = None):
@@ -262,13 +293,14 @@ class Agent:
     
     def get_all_booked_slots(self):
         ''' Get all booked slots. '''
+        self.__info('Getting all booked slots...')
         res = self.api_list_booked_c3_practical_slots()
         if not res['success']:
-            print('Failed to get all booked slots. Error: ' + res['message'])
+            self.__error('Failed to get all booked slots. Error: ' + res['message'])
             return []
         slots = [BookedSlot.from_dict(slot) for slot in res['data']['theoryActiveBookingList']]
-        print(f'Got {len(slots)} booked slots:')
-        pp(slots)
+        self.__info(f'Got {len(slots)} booked slots:')
+        self.__debug(pformat(slots, indent=4))
         return slots
     
     def api_cancel_c3_practical_slot(self, slot: BookedSlot):
@@ -282,9 +314,10 @@ class Agent:
     
     def cancel_practical_slot(self, slot: BookedSlot):
         ''' Cancel a practical slot. '''
+        self.__info(f'Cancelling slot: {pformat(slot, indent=4)}.')
         res = self.api_cancel_c3_practical_slot(slot)
         if not res['success']:
-            print('Failed to cancel slot. Error: ' + res['message'])
+            self.__error('Failed to cancel slot. Error: ' + res['message'])
             return False
-        print('Successfully cancelled slot.')
+        self.__info('Successfully cancelled slot.')
         return True
